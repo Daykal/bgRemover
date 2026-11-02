@@ -1,46 +1,109 @@
+
 mod remover;
 
 use ort::session::Session;
 use std::path::PathBuf;
 use std::sync::Mutex;
-use tauri::{ipc::Response, AppHandle, Manager, State};
+use tauri::{
+    ipc::Response,
+    path::BaseDirectory,
+    AppHandle,
+    Manager,
+    State,
+};
 
 #[derive(Default)]
 struct AppState {
     /// The loaded model. Starts empty and is filled on the first image.
     session: Mutex<Option<Session>>,
-    /// The last transparent result, so "Save" doesn't need it sent back
+
+    /// The last transparent result.
     last_result: Mutex<Option<Vec<u8>>>,
 }
 
-#[tauri::command]
-async fn remove_background(path: String, app: AppHandle) -> Result<Response, String> {
-    let model_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/model.onnx");
+/// Find the ONNX model.
+/// Development uses the source directory.
+/// Production uses the bundled application resources.
+fn find_model(app: &AppHandle) -> Result<PathBuf, String> {
 
-    let png = tauri::async_runtime::spawn_blocking(move || -> Result<Vec<u8>, String> {
-        let state = app.state::<AppState>();
+    // Development path
+    #[cfg(debug_assertions)]
+    {
+        let dev_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("models/model.onnx");
 
-        // Load the model only the first time
-        let mut guard = state.session.lock().map_err(|e| e.to_string())?;
-        if guard.is_none() {
-            let session = remover::load_session(&model_path).map_err(|e| format!("{e:#}"))?;
-            *guard = Some(session);
+        if dev_path.is_file() {
+            return Ok(dev_path);
         }
-        let session = guard.as_mut().ok_or("Model not loaded")?;
+    }
 
-        let png = remover::remove_background(session, &PathBuf::from(path))
+    // Production / installed application path
+    let model_path = app
+        .path()
+        .resolve("models/model.onnx", BaseDirectory::Resource)
+        .map_err(|e| format!("Could not resolve model path: {e}"))?;
+
+    if !model_path.is_file() {
+        return Err(format!(
+            "ONNX model not found at: {}",
+            model_path.display()
+        ));
+    }
+
+    Ok(model_path)
+}
+
+#[tauri::command]
+async fn remove_background(
+    path: String,
+    app: AppHandle,
+) -> Result<Response, String> {
+
+    // Find model before starting the background task
+    let model_path = find_model(&app)?;
+
+    let png = tauri::async_runtime::spawn_blocking(
+        move || -> Result<Vec<u8>, String> {
+
+            let state = app.state::<AppState>();
+
+            // Load model only once
+            let mut guard = state
+                .session
+                .lock()
+                .map_err(|e| e.to_string())?;
+
+            if guard.is_none() {
+                let session = remover::load_session(&model_path)
+                    .map_err(|e| format!("{e:#}"))?;
+
+                *guard = Some(session);
+            }
+
+            let session = guard
+                .as_mut()
+                .ok_or("Model not loaded")?;
+
+            let png = remover::remove_background(
+                session,
+                &PathBuf::from(path),
+            )
             .map_err(|e| format!("{e:#}"))?;
 
-        *state.last_result.lock().map_err(|e| e.to_string())? = Some(png.clone());
-        Ok(png)
-    })
+            *state.last_result
+                .lock()
+                .map_err(|e| e.to_string())? = Some(png.clone());
+
+            Ok(png)
+        },
+    )
     .await
     .map_err(|e| e.to_string())??;
 
     Ok(Response::new(png))
 }
 
-/// Reads a file and sends its raw bytes to the UI (used for previews)
+/// Reads a file and sends its raw bytes to the UI.
 #[tauri::command]
 fn load_file(path: String) -> Result<Response, String> {
     std::fs::read(&path)
@@ -54,10 +117,20 @@ fn save_result(
     background: remover::Background,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let guard = state.last_result.lock().map_err(|e| e.to_string())?;
-    let png = guard.as_ref().ok_or("Nothing to save yet")?;
-    let out = remover::composite(png, &background).map_err(|e| format!("{e:#}"))?;
-    std::fs::write(path, out).map_err(|e| e.to_string())
+
+    let guard = state.last_result
+        .lock()
+        .map_err(|e| e.to_string())?;
+
+    let png = guard
+        .as_ref()
+        .ok_or("Nothing to save yet")?;
+
+    let out = remover::composite(png, &background)
+        .map_err(|e| format!("{e:#}"))?;
+
+    std::fs::write(path, out)
+        .map_err(|e| e.to_string())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
