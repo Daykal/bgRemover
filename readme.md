@@ -24,11 +24,11 @@
 ## Screenshots
 
 <p align="center">
-  <img src="./frontend/bg-remover/src/assets/s1.png" width="256" />
-  <img src="./frontend/bg-remover/src/assets/s2.png" width="256" />
-  <img src="./frontend/bg-remover/src/assets/s3.png" width="256" />
-  <img src="./frontend/bg-remover/src/assets/s4.png" width="256" />
-  <img src="./frontend/bg-remover/src/assets/s5.png" width="256" />
+  <img src="./frontend/bg-remover/src/assets/s1.webp" width="256" />
+  <img src="./frontend/bg-remover/src/assets/s2.webp" width="256" />
+  <img src="./frontend/bg-remover/src/assets/s3.webp" width="256" />
+  <img src="./frontend/bg-remover/src/assets/s4.webp" width="256" />
+  <img src="./frontend/bg-remover/src/assets/s5.webp" width="256" />
 </p>
 
 ## Build From Source
