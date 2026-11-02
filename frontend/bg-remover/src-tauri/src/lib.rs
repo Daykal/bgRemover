@@ -1,36 +1,63 @@
 mod remover;
 
+use ort::session::Session;
 use std::path::PathBuf;
 use std::sync::Mutex;
-use tauri::{ipc::Response, State};
+use tauri::{ipc::Response, AppHandle, Manager, State};
 
-/// Remembers the last result so "Save" can write it without sending it back and forth
 #[derive(Default)]
 struct AppState {
+    /// The loaded model. Starts empty and is filled on the first image.
+    session: Mutex<Option<Session>>,
+    /// The last transparent result, so "Save" doesn't need it sent back
     last_result: Mutex<Option<Vec<u8>>>,
 }
 
 #[tauri::command]
-async fn remove_background(path: String, state: State<'_, AppState>) -> Result<Response, String> {
+async fn remove_background(path: String, app: AppHandle) -> Result<Response, String> {
     let model_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/model.onnx");
 
-    // Run the heavy work on a separate thread so the UI doesn't freeze
-    let png = tauri::async_runtime::spawn_blocking(move || {
-        remover::remove_background(&PathBuf::from(path), &model_path)
+    let png = tauri::async_runtime::spawn_blocking(move || -> Result<Vec<u8>, String> {
+        let state = app.state::<AppState>();
+
+        // Load the model only the first time
+        let mut guard = state.session.lock().map_err(|e| e.to_string())?;
+        if guard.is_none() {
+            let session = remover::load_session(&model_path).map_err(|e| format!("{e:#}"))?;
+            *guard = Some(session);
+        }
+        let session = guard.as_mut().ok_or("Model not loaded")?;
+
+        let png = remover::remove_background(session, &PathBuf::from(path))
+            .map_err(|e| format!("{e:#}"))?;
+
+        *state.last_result.lock().map_err(|e| e.to_string())? = Some(png.clone());
+        Ok(png)
     })
     .await
-    .map_err(|e| e.to_string())?
-    .map_err(|e| format!("{e:#}"))?;
+    .map_err(|e| e.to_string())??;
 
-    *state.last_result.lock().unwrap() = Some(png.clone());
     Ok(Response::new(png))
 }
 
+/// Reads a file and sends its raw bytes to the UI (used for previews)
 #[tauri::command]
-fn save_result(path: String, state: State<'_, AppState>) -> Result<(), String> {
-    let guard = state.last_result.lock().unwrap();
+fn load_file(path: String) -> Result<Response, String> {
+    std::fs::read(&path)
+        .map(Response::new)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn save_result(
+    path: String,
+    background: remover::Background,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let guard = state.last_result.lock().map_err(|e| e.to_string())?;
     let png = guard.as_ref().ok_or("Nothing to save yet")?;
-    std::fs::write(path, png).map_err(|e| e.to_string())
+    let out = remover::composite(png, &background).map_err(|e| format!("{e:#}"))?;
+    std::fs::write(path, out).map_err(|e| e.to_string())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -39,7 +66,11 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState::default())
-        .invoke_handler(tauri::generate_handler![remove_background, save_result])
+        .invoke_handler(tauri::generate_handler![
+            remove_background,
+            load_file,
+            save_result
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

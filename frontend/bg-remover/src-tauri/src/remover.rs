@@ -1,13 +1,30 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use image::imageops::{self, FilterType};
-use image::{GrayImage, Luma};
+use image::{GrayImage, Luma, Rgba, RgbaImage};
 use ort::{session::Session, value::Tensor};
+use serde::Deserialize;
 use std::io::Cursor;
 use std::path::Path;
 
 const MODEL_SIZE: u32 = 1024;
 
-pub fn remove_background(input_path: &Path, model_path: &Path) -> Result<Vec<u8>> {
+/// What the user picked as a background. The UI sends this as JSON,
+/// e.g. { "kind": "color", "hex": "#ff0000" }
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum Background {
+    Transparent,
+    Color { hex: String },
+    Image { path: String },
+}
+
+pub fn load_session(model_path: &Path) -> Result<Session> {
+    Session::builder()?
+        .commit_from_file(model_path)
+        .context("Could not load the ONNX model")
+}
+
+pub fn remove_background(session: &mut Session, input_path: &Path) -> Result<Vec<u8>> {
     let img = image::open(input_path)
         .with_context(|| format!("Could not open {}", input_path.display()))?;
     let (width, height) = (img.width(), img.height());
@@ -28,11 +45,7 @@ pub fn remove_background(input_path: &Path, model_path: &Path) -> Result<Vec<u8>
         }
     }
 
-    let mut session = Session::builder()?
-        .commit_from_file(model_path)
-        .context("Could not load the ONNX model")?;
     let input_name = session.inputs()[0].name().to_string();
-
     let tensor = Tensor::from_array(([1_usize, 3, size, size], input))?;
     let outputs = session.run(ort::inputs![input_name.as_str() => tensor])?;
     let (_shape, data) = outputs[0].try_extract_tensor::<f32>()?;
@@ -62,8 +75,49 @@ pub fn remove_background(input_path: &Path, model_path: &Path) -> Result<Vec<u8>
         pixel[3] = mask_full.get_pixel(x, y)[0];
     }
 
-    // Encode as PNG in memory instead of writing a file
-    let mut png_bytes = Vec::new();
-    result.write_to(&mut Cursor::new(&mut png_bytes), image::ImageFormat::Png)?;
-    Ok(png_bytes)
+    encode_png(&result)
+}
+
+/// Put the transparent cut-out on top of the chosen background and return PNG bytes
+pub fn composite(png: &[u8], background: &Background) -> Result<Vec<u8>> {
+    if let Background::Transparent = background {
+        return Ok(png.to_vec());
+    }
+
+    let fg = image::load_from_memory(png)?.to_rgba8();
+    let (w, h) = fg.dimensions();
+
+    let mut canvas: RgbaImage = match background {
+        Background::Color { hex } => {
+            let [r, g, b] = parse_hex(hex)?;
+            RgbaImage::from_pixel(w, h, Rgba([r, g, b, 255]))
+        }
+        Background::Image { path } => image::open(path)
+            .with_context(|| format!("Could not open background {path}"))?
+            // fill the whole frame and crop the overflow, like CSS "cover"
+            .resize_to_fill(w, h, FilterType::Lanczos3)
+            .to_rgba8(),
+        Background::Transparent => unreachable!(),
+    };
+
+    imageops::overlay(&mut canvas, &fg, 0, 0);
+    encode_png(&canvas)
+}
+
+fn parse_hex(hex: &str) -> Result<[u8; 3]> {
+    let h = hex.trim_start_matches('#');
+    if h.len() != 6 {
+        bail!("Bad color: {hex}");
+    }
+    Ok([
+        u8::from_str_radix(&h[0..2], 16)?,
+        u8::from_str_radix(&h[2..4], 16)?,
+        u8::from_str_radix(&h[4..6], 16)?,
+    ])
+}
+
+fn encode_png(img: &RgbaImage) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    img.write_to(&mut Cursor::new(&mut bytes), image::ImageFormat::Png)?;
+    Ok(bytes)
 }
